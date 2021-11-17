@@ -1,203 +1,144 @@
+import os
+import random
+import itertools
+import os
+import tqdm
+import random
+import cv2
+import sys
+import numpy as np
+import h5py
+import torch
+from torch.autograd import Variable
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from torch.autograd import Variable
-import collections
-import numpy as np
+import torch.optim as optim
 
-_EPS = 1e-10
+# from torch_geometric.data import Data
+from progressbar import ProgressBar
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+from data import PhysicsDataset
+from config import gen_args
+from utils import load_data
+from meshnet_modules import MeshGraph
 
-MultiGraph = collections.namedtuple('Graph', ['node_features', 'edge_sets'])
+trans_to_tensor = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+seed = 9
+torch.manual_seed(seed)
 
+args = gen_args()
+print(args.dataf)
+datasets = {}
+data_n_batches = {}
+dataloaders = {}
 
-class MLP(nn.Module):
-    """Two-layer fully-connected ELU net with batch norm."""
+for phase in ['train', 'valid']:
+    datasets[phase] = PhysicsDataset(args, phase=phase, trans_to_tensor=trans_to_tensor)
 
-    def __init__(self, n_in, n_hid, n_out, do_prob=0.):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(n_in, n_hid)
-        self.fc2 = nn.Linear(n_hid, n_out)
-        self.bn = nn.BatchNorm1d(n_out)
-        self.dropout_prob = do_prob
+    if args.gen_data:
+        datasets[phase].gen_data()
+    else:
+        datasets[phase].load_data()
 
-        self.init_weights()
+    dataloaders[phase] = DataLoader(
+        datasets[phase], batch_size=args.batch_size,
+        shuffle=True if phase == 'train' else True,
+        num_workers=args.num_workers)
 
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight.data)
-                m.bias.data.fill_(0.1)
-            elif isinstance(m, nn.BatchNorm1d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-
-    def batch_norm(self, inputs):
-        x = inputs.view(inputs.size(0) * inputs.size(1), -1)
-        x = self.bn(x)
-        return x.view(inputs.size(0), inputs.size(1), -1)
-
-    def forward(self, inputs):
-        # Input shape: [num_sims, num_things, num_features]
-        x = F.elu(self.fc1(inputs))
-        x = F.dropout(x, self.dropout_prob, training=self.training)
-        x = F.elu(self.fc2(x))
-        return self.batch_norm(x)
+    data_n_batches[phase] = len(dataloaders[phase])
 
 
-class GraphNetBlock(nn.Module):
-    def __init__(self):
-        super(GraphNetBlock, self).__init__()
-        """Multi-Edge Interaction Network with residual connections."""
-        '''_update_edge_features'''
-        self.edge_mlp = MLP(128 + 128 + 32, 128, 32)
-        self.node_mlp = MLP(128 + 32, 256, 128)
 
-    def update_node_features(self, nodes, edges, pair):
-        """Aggregrates edge features, and applies node function."""
-
-        num_nodes = nodes.shape[1]
-        nodes_feature = torch.zeros((num_nodes, edges.shape[-1]))
-        #nodes_feature2 = torch.zeros((num_nodes, edges.shape[-1]))
-        edges = edges[0]
-        nodes_feature = nodes_feature.index_add_(0, pair[:, 0], edges)
-        nodes_feature = nodes_feature.index_add_(0, pair[:, 1], edges).reshape(1, num_nodes, -1)
-        features = torch.cat([nodes, nodes_feature], -1)
-
-        return self.node_mlp(features)
-
-    def update_edge_features(self, nodes, edges, pair):
-        """Aggregrates node features, and applies edge function."""
-        sender = nodes[:, pair[:, 0]]
-        receiver = nodes[:, pair[:, 1]]
-        features = torch.concat([sender, receiver, edges], -1)
-        return self.edge_mlp(features)
-
-    def forward(self, nodes, edges, pair):
-        # apply edge functions
-
-        new_edge_sets = self.update_edge_features(nodes, edges, pair)
-
-        # apply node function
-        new_node_features = self.update_node_features(nodes, new_edge_sets, pair)
-
-        # add residual connections
-        new_node_features += nodes
-        new_edge_sets = new_edge_sets + edges
-
-        return new_node_features, new_edge_sets
-
-
-class MeshGraph(nn.Module):
-    def __init__(self, args, outputsize, latent_size, number_layers, message_passing_steps):
-        super(MeshGraph, self).__init__()
-        self.args = args
-        self._latent_size = latent_size
-        self._output_size = outputsize
-        self._num_layers = number_layers
-        self._message_passing_steps = message_passing_steps
-        self.edge_feature_dim = 6  # type, length, distance
-        self.node_feature_dim = 10 * 4  # x, y, dx, dy
-        self.edge_hidden = 32
-        
-        self.hidden_dim = 128
-        self.encoder_mlp_edge = MLP(self.edge_feature_dim, self.edge_hidden, self.edge_hidden)
-        self.encoder_mlp_node = MLP(self.node_feature_dim, self.hidden_dim, self._latent_size)
-        self.decoder_mlp = nn.Sequential(nn.Linear(self._latent_size, self.hidden_dim), nn.Tanh(),
-                                         nn.Linear(self.hidden_dim, self._output_size))
-        self.variance = 5e-5
-        self.mse_loss = nn.MSELoss()
-
-    def nll_gaussian(self, preds, target, add_const=False):
-        variance = self.variance
-        neg_log_p = ((preds - target) ** 2 / (2 * variance))
-        if add_const:
-            const = 0.5 * np.log(2 * np.pi * variance)
-            neg_log_p += const
-        return neg_log_p.sum() / (target.size(0) * target.size(1))
-
-    def forward(self, nodes, edge_pair, edge_attr):
-        """encode process decoder """
-        '''Encodes node and edge features into latent features'''
-        # node_set shape = [B, Time steps, Number of atoms, Position]
-        # edge_set shape = [B, 2]
-        # print(nodes.shape, edge_pair.shape, edge_attr.shape, "?")
-        # [1, 130, 5, 2]) torch.Size([10, 2]) torch.Size([10, 2]
-        # node_latents = self.encoder_mlp_node(nodes)
-        # edge_set = self.encoder_mlp_edge(edge_attr)
-        history_step = self.args.his
-        rollout_step = self.args.pred_roll
-        total_step = history_step + rollout_step
-        num_balls = nodes.shape[-2]
-        
-        '''Decodes node features from graph'''
-        edge_attr = edge_attr.reshape(1, edge_attr.shape[0], -1).double()
-        
-        
-        for t in range(1):
-            window_nodes = nodes[0] #[:, t * total_step: t * total_step + total_step][0]
-            #print(window_nodes.shape,'window')
-
-            history_nodes = window_nodes[:history_step].permute(1, 0, 2).reshape(1, num_balls, -1)
-            #print(window_nodes.shape, history_nodes.shape, nodes.shape,'here')
-            gt_history = window_nodes[: history_step]
-            gt_future = window_nodes[history_step:]
-            pos_diff = window_nodes[history_step][edge_pair[:, 0]] - window_nodes[history_step][edge_pair[:, 1]]
-            pos_diff = torch.abs(pos_diff)
-            edge_attr = torch.cat([edge_attr, pos_diff.reshape(1, edge_attr.shape[1], -1)], -1)
-
-            pred_all = []
-            pred_acc = []
-            target_acc = []
-        
-            cur_position = gt_history[-1,:,:2]
-            gt_cur_pos = cur_position
-            cur_vel = gt_history[-1, :, 2:]
-            prev_position = gt_history[-2, :, :2]
-            gt_prev_pos = prev_position
-            prev_vel = gt_history[-2, :, 2:]
-
-            for pred_t in range(rollout_step):
-                # calculate ground truth acceleration
-                target_position = gt_future[:, pred_t, :2]
-                target_acceleration = target_position - 2 * gt_cur_pos + gt_prev_pos
-                gt_cur_pos = target_position
-                gt_prev_pos = gt_cur_pos
-                target_acc.append(target_acceleration) 
-                
-                # encode
-                latent_nodes = self.encoder_mlp_node(history_nodes)
-                latent_edges = self.encoder_mlp_edge(edge_attr.float())
-
-                for _ in range(self._message_passing_steps):
-                    latent_nodes, latent_edges = GraphNetBlock()(latent_nodes, latent_edges, edge_pair)
-
-                acceleration = self.decoder_mlp(latent_nodes)
-                # integrate and update edge, update prev_position, update history
-                prev_position = cur_position
-                #print(cur_position.shape, acceleration.shape, prev_position.shape)
-                cur_position = 2 * cur_position + acceleration - prev_position
-                cur_vel = cur_vel + acceleration
-                 
-                # update edge displacement
-                pos_diff = torch.abs(cur_position[:, edge_pair[:, 0]] - cur_position[:, edge_pair[:, 1]])
-                edge_attr[:,:,-2:] = pos_diff
-                
-                pred_all.append(cur_position)
-                pred_acc.append(acceleration)
-                
-
-                # update node feature with new hostory.
-                history_nodes = history_nodes.reshape(1, num_balls, history_step, 4)
-                new_state = torch.cat([cur_position.reshape(1, num_balls, 1, -1), cur_vel.reshape(1, num_balls, 1, -1)], -1)
-                # new_state = gt_future[:, pred_t]
-                history_nodes = torch.cat([history_nodes[:, :, 1:, :], new_state], -2)
-                history_nodes = history_nodes.reshape(1, num_balls, -1)
+if __name__ == '__main__':
+    save_folder = args.log
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+    model_path = save_folder + '/model'
+    writer = SummaryWriter('{}/'.format(save_folder))
+    phase = 'train'
+    bar = ProgressBar(max_value=data_n_batches[phase])
+    meshnet = MeshGraph(args=args, outputsize=2, latent_size=128, number_layers=2, message_passing_steps=args.num_message_passing)
+    optimizer = optim.Adam(list(meshnet.parameters()), lr=1e-4)
+    log_per_iter = 100
+    val_iter = 500
+    train_loader = dataloaders['train']
+    val_loader = dataloaders['valid']
+    print(len(val_loader),'val len',len(train_loader))
+    best_nll = 1e20
+    for phase in ['train']:
+        loader = train_loader
+        train_iter = -1
+        for train_i, data in bar(enumerate(loader)):
             
-            preds = torch.stack(pred_all, dim=1)
-            pred_acc= torch.stack(pred_acc, dim=1)
-            target_acc = torch.stack(target_acc, dim=1)
-            loss_nll = self.nll_gaussian(preds[0], gt_future[:,:,:2])
-            loss_mse = self.mse_loss(preds[0], gt_future[:,:,:2])
-            loss_acc_mse = self.mse_loss(pred_acc, target_acc)
-            return preds, loss_nll, loss_mse, loss_acc_mse
+            train_iter += 1
+            kps_gt, edge_type, edge_attr = data
+            meshnet.train()
+            optimizer.zero_grad()
+            pair = []
+            filtered_edge_attr = []
+            cnt = 0
+            for x in range(args.n_kp):
+                for y in range(x + 1, args.n_kp):
+                    this_edge = edge_type[0, cnt]
+                    this_attr = edge_attr[0, cnt]
+                    if this_edge != 0:
+                        pair.append([x, y])
+                        filtered_edge_attr.append([this_edge, this_attr])
+                cnt += 1
+
+            pair = torch.tensor(pair)
+            if len(filtered_edge_attr) < 2:
+                continue
+            filtered_edge_attr = torch.tensor(filtered_edge_attr)
+
+            output, loss_nll, loss_mse, loss_acc = meshnet(kps_gt, pair, filtered_edge_attr)
+            loss_acc.backward()
+            optimizer.step()
+            if train_iter % log_per_iter == 0:
+                writer.add_scalar("Loss/nll_train", loss_nll.item(), train_iter)
+                writer.add_scalar("Loss/mse_train", loss_mse.item(), train_iter)
+            if train_iter % val_iter == 0:
+                nll_eval = []
+                mse_eval = []
+                acc_mse_eval = []
+                meshnet.eval()
+                for eval_i, data in enumerate(val_loader):
+                    if eval_i > 100:
+                        break
+                    kps_gt, edge_type, edge_attr = data
+                    pair = []
+                    filtered_edge_attr = []
+                    cnt = 0
+                    for x in range(args.n_kp):
+                        for y in range(x + 1, args.n_kp):
+                            this_edge = edge_type[0, cnt]
+                            this_attr = edge_attr[0, cnt]
+                            if this_edge != 0:
+                                pair.append([x, y])
+                                filtered_edge_attr.append([this_edge, this_attr])
+                        cnt += 1
+                    pair = torch.tensor(pair)
+                    if len(filtered_edge_attr) < 2:
+                        continue
+                    filtered_edge_attr = torch.tensor(filtered_edge_attr)
+                    output, loss_nll_eval, loss_mse_eval, loss_acc_eval = meshnet(kps_gt, pair, filtered_edge_attr)
+                    nll_eval.append(loss_nll_eval.item())
+                    mse_eval.append(loss_mse_eval.item())
+                    acc_mse_eval.append(loss_acc_eval.item())
+                writer.add_scalar("Eval/nll", np.mean(nll_eval), train_iter)
+                writer.add_scalar("Eval/mse", np.mean(mse_eval), train_iter)
+                writer.add_scalar("Eval/mse_acc", np.mean(acc_mse_eval), train_iter)
+                print('iter:', train_iter, 'nll:', np.mean(nll_eval), 'mse:', np.mean(mse_eval), 'accmse:', np.mean(acc_mse_eval))
+                if np.mean(nll_eval) < best_nll:
+                    best_nll = np.mean(nll_eval)
+                    torch.save(meshnet.state_dict(), model_path)
+                    print('model saved!')
+
