@@ -158,6 +158,12 @@ class MeshGraph(nn.Module):
             prev_vel = gt_history[-2, :, 2:]
 
             for pred_t in range(rollout_step):
+                # calculate ground truth acceleration
+                target_position = gt_future[:, pred_t, :2]
+                target_acceleration = target_position - 2 * gt_cur_pos + gt_prev_pos
+                gt_cur_pos = target_position
+                gt_prev_pos = gt_cur_pos
+                target_acc.append(target_acceleration) 
                 
                 # encode
                 latent_nodes = self.encoder_mlp_node(history_nodes)
@@ -189,8 +195,9 @@ class MeshGraph(nn.Module):
                 history_nodes = history_nodes.reshape(1, num_balls, -1)
             
             preds = torch.stack(pred_all, dim=1)
-
+            pred_acc= torch.stack(pred_acc, dim=1)
+            target_acc = torch.stack(target_acc, dim=1)
             loss_nll = self.nll_gaussian(preds[0], gt_future[:,:,:2])
             loss_mse = self.mse_loss(preds[0], gt_future[:,:,:2])
-
-            return preds, loss_nll, loss_mse, gt_future
+            loss_acc_mse = self.mse_loss(pred_acc, target_acc)
+            return preds, loss_nll, loss_mse, loss_acc_mse
